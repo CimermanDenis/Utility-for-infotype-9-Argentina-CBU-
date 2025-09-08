@@ -34,7 +34,8 @@ CLASS zcl_py_ar_cbu DEFINITION
                c_banks TYPE p0009-banks VALUE 'AR',  " Argentina
                c_bkont TYPE p0009-bkont VALUE 'CA',  " control key
                c_zlsch TYPE p0009-zlsch VALUE 'U',   " Transferencia Bancaria (Citi)
-               c_waers TYPE p0009-waers VALUE 'ARS'. " Argentine Peso
+               c_waers TYPE p0009-waers VALUE 'ARS', " Argentine Peso
+               c_cbuln TYPE i VALUE 22.
 
     " Derive BANKL from SUBTY/CBU (SUBTY '0' => '0016'; SUBTY '2' => from CBU)
     CLASS-METHODS derive_bankl
@@ -138,12 +139,16 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD run.
-    DATA: lv_bkref TYPE p0009-bkref,
-          lv_bankn TYPE p0009-bankn,
-          ls_old   TYPE p0009,
-          lv_msg   TYPE string,
-          lv_leave TYPE endda,
-          lv_abrdt TYPE endda.
+    DATA: lv_bkref     TYPE p0009-bkref,
+          lv_bankn     TYPE p0009-bankn,
+          ls_old       TYPE p0009,
+          lv_msg       TYPE string,
+          lv_leave     TYPE endda,
+          lv_abrdt     TYPE endda,
+          lv_leave_txt TYPE string,
+          lv_abrdt_txt TYPE string,
+          lv_begda_txt TYPE string,
+          lv_endda_txt TYPE string.
 
     "1) Validate inputs
     lv_msg = validate_inputs( i_params ).
@@ -181,7 +186,9 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
     "Check BEGDA vs IT0003-ABRDT
     IF lv_abrdt IS NOT INITIAL AND i_params-begda <= lv_abrdt.
       r_result-success = abap_false.
-      r_result-message = |BEGDA { i_params-begda } cannot be ≤ IT0003-ABRDT { lv_abrdt }.| .
+      lv_begda_txt = |{ i_params-begda DATE = USER }|.
+      lv_abrdt_txt = |{ lv_abrdt DATE = USER }|.
+      r_result-message = |BEGDA { lv_begda_txt } cannot be ≤ IT0003-ABRDT { lv_abrdt_txt }.| .
       RETURN.
     ENDIF.
 
@@ -270,7 +277,10 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
         ROLLBACK WORK.
         unlock_emp( i_params-pernr ).
         r_result-success = abap_false.
-        r_result-message = |Employee terminated on { lv_leave }, not a valid period for interval { ls_params_ins-begda }–{ i_params-endda }.|.
+        lv_begda_txt = |{ ls_params_ins-begda DATE = USER }|.
+        lv_endda_txt = |{ ls_params_ins-endda DATE = USER }|.
+        lv_leave_txt = |{ lv_leave DATE = USER }|.
+        r_result-message = |Employee terminated on { lv_leave_txt }, not a valid period for interval { lv_begda_txt }–{ lv_endda_txt }.|.
         RETURN.
       ENDIF.
     ENDIF.
@@ -298,9 +308,10 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
     "11) Commit + unlock
     COMMIT WORK AND WAIT.
     unlock_emp( i_params-pernr ).
-
     r_result-success = abap_true.
-    r_result-message = |IT0009 created for { i_params-pernr } ({ ls_params_ins-begda }–{ ls_params_ins-endda }).|.
+    lv_begda_txt = |{ ls_params_ins-begda DATE = USER }|. "format output message according to the user parameters
+    lv_endda_txt = |{ ls_params_ins-endda DATE = USER }|.
+    r_result-message = |IT0009 created for { i_params-pernr } ({ lv_begda_txt }–{ lv_endda_txt }).|.
   ENDMETHOD.
 
   METHOD derive_bankl.
@@ -312,7 +323,7 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
       WHEN '0'.
         e_bankl = '0016'.
       WHEN '2'.
-        IF strlen( i_cbu ) = 22.
+        IF strlen( i_cbu ) = c_cbuln.
           "Assumption: BANKL = first 8 digits of CBU (AR convention)
           e_bankl = i_cbu+0(7).
         ELSE.
@@ -329,19 +340,36 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
     "Validate only for subtype '2' (derived from CBU)
     IF i_subty = '2'.
       "BNKA delete flag is LOEVM (space = active)
-      SELECT SINGLE bankl
-        FROM bnka
-        WHERE banks = @i_banks
-          AND bankl = @i_bankl
-          AND loevm = @space
-        INTO @DATA(lv_found).
+*      SELECT SINGLE bankl
+*        FROM bnka
+*        WHERE banks = @i_banks
+*          AND bankl = @i_bankl
+*          AND loevm = @space
+*        INTO @DATA(lv_found).
+*      IF sy-subrc <> 0 OR lv_found IS INITIAL.
+*        r_msg = |Bank key { i_bankl } not found in BNKA for country { i_banks } or it is marked for deletion.| .
+*      ENDIF.
+      DATA: ls_addr TYPE bapi1011_address,
+            ls_det  TYPE bapi1011_detail,
+            ls_ret  TYPE bapiret2.
 
-      IF sy-subrc <> 0 OR lv_found IS INITIAL.
-        r_msg = |Bank key { i_bankl } not found in BNKA for country { i_banks } or it is marked for deletion.| .
+      CALL FUNCTION 'BAPI_BANK_GETDETAIL'
+        EXPORTING
+          bankcountry  = i_banks
+          bankkey      = i_bankl
+        IMPORTING
+          bank_address = ls_addr
+          bank_detail  = ls_det
+          return       = ls_ret.
+
+      IF ls_ret-type CA 'AE'
+         OR ls_addr-bank_no IS INITIAL          "not found / unusable
+         OR ls_det-bank_delete IS NOT INITIAL.  "marked for deletion
+        r_msg = |Bank key { i_bankl } not found for country { i_banks } or it is marked for deletion.| .
+        RETURN.
       ENDIF.
     ENDIF.
   ENDMETHOD.
-
 
   METHOD validate_inputs.
     IF i_params-bankl IS INITIAL.
@@ -354,7 +382,7 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    IF strlen( i_params-cbu ) <> 22.
+    IF strlen( i_params-cbu ) <> c_cbuln.
       r_msg = 'CBU must have exactly 22 digits'.
       RETURN.
     ENDIF.
@@ -367,20 +395,28 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD derive_from_cbu.
+    DATA: lv_bkref TYPE p0009-bkref,
+          lv_bankn TYPE p0009-bankn.
+
     CASE i_subty.
       WHEN '0'.
         DATA(lv_first8) = i_cbu+0(8).
         DATA(lv_tail14) = i_cbu+8(14).
-        CONCATENATE '0'   lv_first8 INTO e_bkref.
-        CONCATENATE '000' lv_tail14 INTO e_bankn.
+        CONCATENATE '0'   lv_first8 INTO lv_bkref.
+        CONCATENATE '000' lv_tail14 INTO lv_bankn.
       WHEN '2'.
         DATA(lv_first18)  = i_cbu+0(18).
         DATA(lv_last4)    = i_cbu+18(4).
-        e_bkref = lv_last4.
-        e_bankn = lv_first18.
+        lv_bkref = lv_last4.
+        lv_bankn = lv_first18.
       WHEN OTHERS.
         r_msg = |Only subtypes 0 and 2 are supported (given: { i_subty })|.
     ENDCASE.
+
+    IF r_msg IS INITIAL.
+      e_bkref = lv_bkref.
+      e_bankn = lv_bankn.
+    ENDIF.
   ENDMETHOD.
 
   METHOD lock_emp.
@@ -416,6 +452,13 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
         infty_tab = lt_p0009
       EXCEPTIONS
         OTHERS    = 1.
+
+    "Handle FM return code (for ATC SLIN)
+    IF sy-subrc <> 0.
+      "Read failed (no auth/technical issue) -> no overlap returned
+      CLEAR r_old.
+      RETURN.
+    ENDIF.
 
     LOOP AT lt_p0009 ASSIGNING FIELD-SYMBOL(<l>)
          WHERE begda <= i_begda
@@ -467,8 +510,14 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
       IMPORTING
         return        = ls_ret.
 
-    IF sy-subrc <> 0 OR ls_ret-type = 'E' OR ls_ret-type = 'A'.
-      r_msg = |Delimiting failed: { ls_ret-message } Keys: BEGDA={ lv_old_begda }, ENDDA={ lv_old_endda } NewEnd: { lv_new_end }|.
+    IF ls_ret-type = 'E' OR ls_ret-type = 'A'.
+      DATA: lv_old_begda_txt TYPE string,
+            lv_old_endda_txt TYPE string,
+            lv_new_end_txt   TYPE string.
+      lv_old_begda_txt = |{ lv_old_begda DATE = USER }|.
+      lv_old_endda_txt = |{ lv_old_endda DATE = USER }|.
+      lv_new_end_txt = |{ lv_new_end DATE = USER }|.
+      r_msg = |Delimiting failed: { ls_ret-message } Keys: BEGDA={ lv_old_begda_txt }, ENDDA={ lv_old_endda_txt } NewEnd: { lv_new_end_txt }|.
     ELSE.
       r_msg = ''.
     ENDIF.
@@ -563,13 +612,13 @@ CLASS zcl_py_ar_cbu IMPLEMENTATION.
       IMPORTING
         return        = ls_ret_ins.
 
-    IF sy-subrc <> 0 OR ls_ret_ins-type = 'E' OR ls_ret_ins-type = 'A'.
+    IF ls_ret_ins-type = 'E' OR ls_ret_ins-type = 'A'.
       r_msg = |Insert failed: { ls_ret_ins-message }|.
     ENDIF.
   ENDMETHOD.
 
   METHOD check_hr_authorizations.
-DATA: lt_p0001 TYPE STANDARD TABLE OF p0001 WITH DEFAULT KEY.
+    DATA: lt_p0001 TYPE STANDARD TABLE OF p0001 WITH DEFAULT KEY.
 
     "Read IT0001 once for the period: for structural authorizations (P_ORGINCON, P_ORGXXCON) we need org. context
     CALL FUNCTION 'HR_READ_INFOTYPE'
@@ -583,7 +632,7 @@ DATA: lt_p0001 TYPE STANDARD TABLE OF p0001 WITH DEFAULT KEY.
         infty_tab = lt_p0001
       EXCEPTIONS
         OTHERS    = 1.
-    " no error handling: empty i0001 is accepted but cannot happen anyway
+    " no error handling: empty i0001 is accepted but it cannot happen anyway
 
 
     "IT0000 – READ (LEVEL = 'R')
